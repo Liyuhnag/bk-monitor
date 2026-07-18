@@ -13,6 +13,7 @@ from copy import deepcopy
 from unittest import mock
 
 import pytest
+import xxhash
 import yaml
 from schema import SchemaError
 
@@ -20,6 +21,7 @@ from api.cmdb.define import TopoTree
 from bkmonitor.as_code.parse import convert_rules
 from bkmonitor.as_code.parse_yaml import StrategyConfigParser
 from bkmonitor.as_code.schema import StrategySchema
+from bkmonitor.models import StrategyModel
 from bkmonitor.strategy.new_strategy import Strategy
 
 pytestmark = pytest.mark.django_db
@@ -133,6 +135,58 @@ def test_convert_rules_passes_issue_config():
         ],
         "alert_levels": [1, 2],
     }
+
+
+def test_convert_rules_skips_cmdb_when_configs_empty():
+    get_topo_tree = mock.patch("bkmonitor.as_code.parse.api.cmdb.get_topo_tree").start()
+    get_dynamic_query = mock.patch("bkmonitor.as_code.parse.api.cmdb.get_dynamic_query").start()
+    search_dynamic_group = mock.patch("bkmonitor.as_code.parse.api.cmdb.search_dynamic_group").start()
+
+    records = convert_rules(
+        bk_biz_id=2,
+        app="app1",
+        configs={},
+        snippets={},
+        notice_group_ids={},
+        action_ids={},
+    )
+
+    assert records == []
+    get_topo_tree.assert_not_called()
+    get_dynamic_query.assert_not_called()
+    search_dynamic_group.assert_not_called()
+
+
+def test_convert_rules_skips_cmdb_when_hash_unchanged():
+    code_config = load_rule_config("issue_config.yaml")
+    hash_str = xxhash.xxh3_128_hexdigest(json.dumps(code_config))
+    StrategyModel.objects.create(
+        bk_biz_id=2,
+        name=code_config["name"],
+        path="issue_config.yaml",
+        hash=hash_str,
+        app="app1",
+        scenario="os",
+        type="monitor",
+    )
+
+    get_topo_tree = mock.patch("bkmonitor.as_code.parse.api.cmdb.get_topo_tree").start()
+    get_dynamic_query = mock.patch("bkmonitor.as_code.parse.api.cmdb.get_dynamic_query").start()
+    search_dynamic_group = mock.patch("bkmonitor.as_code.parse.api.cmdb.search_dynamic_group").start()
+
+    records = convert_rules(
+        bk_biz_id=2,
+        app="app1",
+        configs={"issue_config.yaml": deepcopy(code_config)},
+        snippets={},
+        notice_group_ids={"ops.yaml": 1},
+        action_ids={},
+    )
+
+    assert records == []
+    get_topo_tree.assert_not_called()
+    get_dynamic_query.assert_not_called()
+    search_dynamic_group.assert_not_called()
 
 
 def test_strategy_unparse_issue_config_round_trip():

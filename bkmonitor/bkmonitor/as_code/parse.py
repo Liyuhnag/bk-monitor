@@ -203,6 +203,29 @@ def convert_actions(
     return records
 
 
+def _collect_changed_rule_configs(
+    configs: dict[str, dict],
+    snippets: dict[str, dict],
+    path_strategies: dict,
+) -> list[tuple]:
+    """
+    渲染 snippet、计算 hash，并与 DB 中已有策略比对。
+    返回发生变更的配置列表：(path, config, hash_str, snippet, old_strategy)
+    """
+    changed = []
+    for path, config in configs.items():
+        snippet = snippets.get(config.pop("snippet", ""), "")
+        if snippet:
+            config = nested_update(config, snippet)
+
+        hash_str = xxhash.xxh3_128_hexdigest(json.dumps(config))
+        old_strategy = path_strategies.get(path)
+        if old_strategy and hash_str == old_strategy.hash:
+            continue
+
+        changed.append((path, config, hash_str, snippet, old_strategy))
+    return changed
+
 def convert_rules(
     bk_biz_id: int,
     app: str,
@@ -222,6 +245,11 @@ def convert_rules(
     strategies = StrategyModel.objects.filter(bk_biz_id=bk_biz_id).only("id", "path", "hash", "name")
     path_strategies = {strategy.path: strategy for strategy in strategies.filter(app=app)}
     name_strategies = {strategy.name.lower(): strategy for strategy in strategies}
+
+    # 先筛出真正变更的策略；无变更则跳过 CMDB 加载
+    changed_configs = _collect_changed_rule_configs(configs, snippets, path_strategies)
+    if not changed_configs:
+        return []
 
     topo_nodes: dict[str, dict] = {}
     for topo_link in api.cmdb.get_topo_tree(bk_biz_id=bk_biz_id).convert_to_topo_link().values():
@@ -255,17 +283,7 @@ def convert_rules(
     )
 
     records = []
-    for path, config in configs.items():
-        snippet = snippets.get(config.pop("snippet", ""), "")
-        if snippet:
-            config = nested_update(config, snippet)
-
-        hash_str = xxhash.xxh3_128_hexdigest(json.dumps(config))
-
-        old_strategy = path_strategies.get(path)
-        if old_strategy and hash_str == old_strategy.hash:
-            continue
-
+    for path, config, hash_str, snippet, old_strategy in changed_configs:
         schema_error = parse_error = validate_error = obj = None
         try:
             config = parser.check(config)
@@ -583,7 +601,7 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
         record["obj"].save()
 
     duty_rules = {}
-    for duty_rule in DutyRule.objects.filter(bk_biz_id=bk_biz_id).only("name", "id", "path"):
+    for duty_rule in DutyRule.objects.filter(bk_biz_id=bk_biz_id).only("name", "id", "path", "app"):
         if duty_rule.path and duty_rule.app == app:
             duty_rules[duty_rule.path] = duty_rule.id
         duty_rules[duty_rule.name] = duty_rule.id
@@ -606,8 +624,10 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
     errors: dict[str, str] = get_errors(chain(notice_records, action_records))
     if errors:
         return errors
-
+    
     for record in chain(notice_records, action_records):
+        # 复用 UI Serializer 保存业务数据；其内部会清空 hash/snippet，故再补写 as_code 元数据
+        # TODO: 第二次可改为 objects.filter(id=...).update(path/app/hash/snippet)，避免整实例再 save
         record["obj"].save()
         record["obj"].instance.path = record["path"]
         record["obj"].instance.app = app
@@ -617,6 +637,8 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
 
     # 策略关联通知组及动作配置
     notice_group_ids = {}
+    # only() 未包含 app，path 非空时访问 user_group.app 会触发延迟加载（N+1）；可改为 only(..., "app")
+    # TODO : 优化查询
     all_user_groups = UserGroup.objects.filter(bk_biz_id__in=[bk_biz_id, 0]).only("id", "path", "name")
     for user_group in all_user_groups:
         if user_group.path and user_group.app == app:
@@ -631,6 +653,8 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
     except ActionPlugin.DoesNotExist:
         # 如果不存在直接忽略
         itsm_plugin_id = 0
+    # only() 未包含 app，path 非空时访问 action.app 会触发延迟加载（N+1）
+    # TODO: only 补上 "app"，避免 N+1 查询
     all_actions = ActionConfig.objects.filter(bk_biz_id__in=[bk_biz_id, 0]).only("id", "path", "name", "plugin_id")
     for action in all_actions:
         if action.path and action.app == app:
@@ -719,7 +743,7 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
         empty_action_ids = {action_id for action_id in all_action_ids if action_id not in app_action_ids}
         no_empty_action_ids = set(all_action_ids) - empty_action_ids
 
-        # 删除空用户组
+        # 删除空用户组     
         UserGroup.objects.filter(bk_biz_id=bk_biz_id, app=app, id__in=empty_user_group_ids).exclude(
             path__in=list(notice_configs.keys())
         ).delete()

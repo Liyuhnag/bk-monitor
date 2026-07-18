@@ -10,6 +10,7 @@ specific language governing permissions and limitations under the License.
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import chain
 
 import xxhash
@@ -52,6 +53,9 @@ from constants.action import ActionPluginType
 from core.drf_resource import api
 
 logger = logging.getLogger(__name__)
+
+# Grafana import_dashboard 无批量接口，客户端侧限制并发以免打爆 Grafana
+GRAFANA_IMPORT_CONCURRENCY = 6
 
 
 def convert_notices(
@@ -329,7 +333,12 @@ def convert_rules(
 def sync_grafana_dashboards(bk_biz_id: int, dashboards: dict[str, dict]):
     """
     同步Grafana仪表盘配置
+
+    公共准备与 folder 创建串行；import_dashboard 限流并发以缩短多仪表盘导入耗时。
     """
+    if not dashboards:
+        return
+
     org_id = get_or_create_org(bk_biz_id)["id"]
     folders = api.grafana.search_folder_or_dashboard(type="dash-folder", org_id=org_id)["data"]
     folder_names_to_ids = {folder["title"].replace("/", "-"): folder["id"] for folder in folders}
@@ -354,9 +363,14 @@ def sync_grafana_dashboards(bk_biz_id: int, dashboards: dict[str, dict]):
         if uid not in datasource_uids:
             raise ValueError(f"datasource({uid}) is not exist")
 
+    if not dashboards:
+        return
+
+    # 串行准备：解析 folder / inputs，并创建缺失 folder（避免并发 create_folder 冲突）
+    import_tasks = []
     for path, dashboard in dashboards.items():
         if "/" in path:
-            folder, path = path.split("/")
+            folder, _ = path.split("/", 1)
         else:
             folder = ""
 
@@ -388,9 +402,38 @@ def sync_grafana_dashboards(bk_biz_id: int, dashboards: dict[str, dict]):
             inputs.append({"name": input_field["name"], **datasource})
 
         dashboard.pop("id", None)
-        api.grafana.import_dashboard(
-            dashboard=dashboard, org_id=org_id, inputs=inputs, overwrite=True, folderId=folder_id
+        import_tasks.append(
+            {
+                "path": path,
+                "dashboard": dashboard,
+                "folder_id": folder_id,
+                "inputs": inputs,
+            }
         )
+
+    def _import_one(task: dict):
+        return api.grafana.import_dashboard(
+            dashboard=task["dashboard"],
+            org_id=org_id,
+            inputs=task["inputs"],
+            overwrite=True,
+            folderId=task["folder_id"],
+        )
+
+    max_workers = min(GRAFANA_IMPORT_CONCURRENCY, len(import_tasks))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {executor.submit(_import_one, task): task["path"] for task in import_tasks}
+        errors = []
+        for future in as_completed(future_to_path):
+            path = future_to_path[future]
+            try:
+                future.result()
+            except Exception as exc:  # 聚合并发导入失败，便于一次暴露多个 path
+                logger.exception("import grafana dashboard failed: %s", path)
+                errors.append(f"{path}: {exc}")
+
+    if errors:
+        raise ValueError(f"import grafana dashboard failed: {'; '.join(errors)}")
 
 
 def convert_assign_groups(

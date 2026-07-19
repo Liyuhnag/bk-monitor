@@ -231,6 +231,7 @@ def _collect_changed_rule_configs(
         changed.append((path, config, hash_str, snippet, old_strategy))
     return changed
 
+
 def convert_rules(
     bk_biz_id: int,
     app: str,
@@ -413,13 +414,16 @@ def sync_grafana_dashboards(bk_biz_id: int, dashboards: dict[str, dict]):
         )
 
     def _import_one(task: dict):
-        return api.grafana.import_dashboard(
+        result = api.grafana.import_dashboard(
             dashboard=task["dashboard"],
             org_id=org_id,
             inputs=task["inputs"],
             overwrite=True,
             folderId=task["folder_id"],
         )
+        if not result or not result.get("result"):
+            raise ValueError((result or {}).get("message") or "unknown error")
+        return result
 
     max_workers = min(GRAFANA_IMPORT_CONCURRENCY, len(import_tasks))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -621,16 +625,16 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
             notice_snippets[path[len("notice/snippets/") :]] = config
         elif path.startswith("notice/"):
             notice_configs[path[len("notice/") :]] = config
-        elif path.startswith("action/snippets"):
-            action_snippets[path[len("action/snippets") :]] = config
+        elif path.startswith("action/snippets/"):
+            action_snippets[path[len("action/snippets/") :]] = config
         elif path.startswith("action/"):
             action_configs[path[len("action/") :]] = config
         elif path.startswith("grafana/"):
             dashboards[path[len("grafana/") :]] = config
+        elif path.startswith("assign_group/snippets/"):
+            assign_snippets[path[len("assign_group/snippets/") :]] = config
         elif path.startswith("assign_group/"):
             assign_configs[path[len("assign_group/") :]] = config
-        elif path.startswith("assign_group/snippets"):
-            assign_snippets[path[len("assign_group/snippets") :]] = config
 
     # 配置转换及检查
     # 轮值规则
@@ -668,7 +672,6 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
     errors: dict[str, str] = get_errors(chain(notice_records, action_records))
     if errors:
         return errors
-    
     for record in chain(notice_records, action_records):
         # 复用 UI Serializer 保存业务数据；其内部会清空 hash/snippet，故再补写 as_code 元数据
         instance = record["obj"].save()
@@ -697,7 +700,9 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
     except ActionPlugin.DoesNotExist:
         # 如果不存在直接忽略
         itsm_plugin_id = 0
-    all_actions = ActionConfig.objects.filter(bk_biz_id__in=[bk_biz_id, 0]).only("id", "path", "name", "plugin_id", "app")
+    all_actions = ActionConfig.objects.filter(bk_biz_id__in=[bk_biz_id, 0]).only(
+        "id", "path", "name", "plugin_id", "app"
+    )
     for action in all_actions:
         if action.path and action.app == app:
             action_ids[action.path] = action.id
@@ -785,7 +790,7 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
         empty_action_ids = {action_id for action_id in all_action_ids if action_id not in app_action_ids}
         no_empty_action_ids = set(all_action_ids) - empty_action_ids
 
-        # 删除空用户组     
+        # 删除空用户组
         UserGroup.objects.filter(bk_biz_id=bk_biz_id, app=app, id__in=empty_user_group_ids).exclude(
             path__in=list(notice_configs.keys())
         ).delete()

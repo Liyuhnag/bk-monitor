@@ -15,6 +15,7 @@ from itertools import chain
 
 import xxhash
 import yaml
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from schema import SchemaError
 
@@ -670,13 +671,15 @@ def import_code_config(bk_biz_id: int, app: str, configs: dict[str, str], overwr
     
     for record in chain(notice_records, action_records):
         # 复用 UI Serializer 保存业务数据；其内部会清空 hash/snippet，故再补写 as_code 元数据
-        # TODO: 第二次可改为 objects.filter(id=...).update(path/app/hash/snippet)，避免整实例再 save
-        record["obj"].save()
-        record["obj"].instance.path = record["path"]
-        record["obj"].instance.app = app
-        record["obj"].instance.hash = record["hash"]
-        record["obj"].instance.snippet = record["snippet"]
-        record["obj"].instance.save()
+        instance = record["obj"].save()
+        # QuerySet.update 不会触发 auto_now，需显式刷新 update_time
+        type(instance).objects.filter(id=instance.pk).update(
+            path=record["path"],
+            app=app,
+            hash=record["hash"],
+            snippet=record["snippet"],
+            update_time=timezone.now(),
+        )
 
     # 策略关联通知组及动作配置
     notice_group_ids = {}

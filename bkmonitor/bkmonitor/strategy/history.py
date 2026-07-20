@@ -81,7 +81,7 @@ def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
     recoverable_snapshots = (
         StrategyHistoryModel.objects.filter(
             strategy_id__in=strategy_ids,
-            operate__in=("create", "update"),
+            operate__in=("create", "update", "bulk_update"),
         )
         .filter(Q(status=True) | Q(message=""))
         .exclude(content={})

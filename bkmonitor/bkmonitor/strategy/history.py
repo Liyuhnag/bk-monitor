@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -55,22 +54,20 @@ def _collect_latest_history_ids(
 ) -> set[int]:
     """使用相关子查询批量获取每个分组中指定排序下的第一条历史 ID。"""
     group_filters = {field: OuterRef(field) for field in partition_by}
-    latest_id = (
-        queryset.order_by()
-        .filter(**group_filters)
-        .order_by(*order_by)
-        .values("id")[:1]
-    )
+    latest_id = queryset.order_by().filter(**group_filters).order_by(*order_by).values("id")[:1]
     return set(queryset.order_by().filter(id=Subquery(latest_id)).values_list("id", flat=True))
 
 
-def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
+def _collect_keep_history_ids(strategy_ids: list[int], before: datetime) -> set[int]:
     """
     计算需要保留的历史记录 ID。
 
     - 所有策略：保留最新一条可恢复的 create/update/bulk_update 快照（content 非空，且 status=True；
       另见下方 message="" 的存量兼容，不是通用成功判定）
     - 策略不存在：额外保留最新一条 delete（线上 delete 默认 status=False，故不按 status 过滤）
+
+    :param before: 清理截止时间；message="" 存量兼容仅对 create_time < before 的记录生效，
+        避免进行中的 save（刚写入、尚未置 status=True）参与“全局最新”竞选并误删旧成功快照
     """
     if not strategy_ids:
         return set()
@@ -83,9 +80,9 @@ def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
             strategy_id__in=strategy_ids,
             operate__in=("create", "update", "bulk_update"),
         )
-        # message="" 仅兼容历史批量更新写入缺陷（成功但未写 status=True），不是通用成功判定；
-        # 新写入应以 status=True 为准，勿扩大该条件的语义。
-        .filter(Q(status=True) | Q(message=""))
+        # message="" 仅兼容历史批量更新写入缺陷（成功但未写 status=True），不是通用成功判定。
+        # 且必须已进入清理窗口（create_time < before），否则会与 save 进行中的临时记录竞态。
+        .filter(Q(status=True) | Q(message="", create_time__lt=before))
         .exclude(content={})
         .exclude(content__isnull=True)
     )
@@ -141,7 +138,7 @@ def clean_strategy_history(params: CleanStrategyHistoryParams) -> int:
 
     先按截止时间圈定可清理范围，再保留可恢复快照：
     - 所有策略：保留最新一条可恢复的 create/update/bulk_update 快照（以 status=True 为准；
-      message="" 仅兼容历史批量更新写入缺陷，不是通用成功判定）
+      message="" 仅兼容已进入清理窗口的存量批量更新写入缺陷，不是通用成功判定）
     - 策略不存在：额外保留最新一条 delete
     其余可清理范围内的记录删除。
 
@@ -151,7 +148,7 @@ def clean_strategy_history(params: CleanStrategyHistoryParams) -> int:
     before = params.before
     deleted = 0
     for strategy_id_chunk in _iter_candidate_strategy_id_chunks(before, params.strategy_ids):
-        keep_ids = _collect_keep_history_ids(strategy_id_chunk)
+        keep_ids = _collect_keep_history_ids(strategy_id_chunk, before)
         queryset = StrategyHistoryModel.objects.filter(
             create_time__lt=before,
             strategy_id__in=strategy_id_chunk,

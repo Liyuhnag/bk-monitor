@@ -56,6 +56,11 @@ def _create_history(
     return history
 
 
+def _keep_ids(strategy_ids: list[int], before: datetime | None = None) -> set[int]:
+    """测试辅助：默认 before=now，使窗口内存量 message="" 记录可参与保留竞选。"""
+    return _collect_keep_history_ids(strategy_ids, before or timezone.now())
+
+
 class TestCleanStrategyHistoryParams:
     @pytest.mark.parametrize("days", [0, -1, True, 1.5, "1", None])
     def test_rejects_invalid_days(self, days):
@@ -105,7 +110,7 @@ class TestCleanStrategyHistoryParams:
 class TestCollectKeepHistoryIds:
     def test_empty_strategy_ids_do_not_query_database(self, django_assert_num_queries):
         with django_assert_num_queries(0, connection=connections["monitor_api"]):
-            assert _collect_keep_history_ids([]) == set()
+            assert _keep_ids([]) == set()
 
     def test_existing_strategy_keeps_only_latest_successful_snapshot(self):
         strategy = _create_strategy("existing")
@@ -121,7 +126,7 @@ class TestCollectKeepHistoryIds:
         # 线上 delete 默认 status=False；已存在策略不保留 delete
         _create_history(strategy.id, base_time + timedelta(hours=3), operate="delete", status=False)
 
-        assert _collect_keep_history_ids([strategy.id]) == {latest_success.id}
+        assert _keep_ids([strategy.id]) == {latest_success.id}
         assert old_success.id != latest_success.id
 
     def test_existing_strategy_with_only_create_keeps_create_snapshot(self):
@@ -133,7 +138,7 @@ class TestCollectKeepHistoryIds:
             status=True,
         )
 
-        assert _collect_keep_history_ids([strategy.id]) == {create_history.id}
+        assert _keep_ids([strategy.id]) == {create_history.id}
 
     def test_deleted_strategy_keeps_latest_successful_snapshot_and_delete(self):
         strategy_id = 900001
@@ -150,7 +155,7 @@ class TestCollectKeepHistoryIds:
         _create_history(strategy_id, base_time, operate="delete", status=False)
         latest_delete = _create_history(strategy_id, base_time + timedelta(hours=2), operate="delete", status=False)
 
-        assert _collect_keep_history_ids([strategy_id]) == {latest_success.id, latest_delete.id}
+        assert _keep_ids([strategy_id]) == {latest_success.id, latest_delete.id}
 
     def test_empty_content_is_not_a_recoverable_snapshot(self):
         strategy = _create_strategy("empty-content")
@@ -164,7 +169,7 @@ class TestCollectKeepHistoryIds:
             content={},
         )
 
-        assert _collect_keep_history_ids([strategy.id]) == {valid_snapshot.id}
+        assert _keep_ids([strategy.id]) == {valid_snapshot.id}
 
     def test_legacy_bulk_update_success_with_empty_message_is_kept(self):
         """存量批量更新写入缺陷兼容：成功但未写 status=True（message=""），应作为可恢复快照保留。"""
@@ -177,7 +182,7 @@ class TestCollectKeepHistoryIds:
             message="",
         )
 
-        assert _collect_keep_history_ids([strategy.id]) == {bulk_success.id}
+        assert _keep_ids([strategy.id]) == {bulk_success.id}
 
     def test_latest_bulk_update_snapshot_is_kept(self):
         """新写入的 bulk_update(status=True) 应作为可恢复快照保留。"""
@@ -191,7 +196,7 @@ class TestCollectKeepHistoryIds:
             status=True,
         )
 
-        assert _collect_keep_history_ids([strategy.id]) == {latest_bulk.id}
+        assert _keep_ids([strategy.id]) == {latest_bulk.id}
 
     def test_newer_bulk_update_overrides_legacy_empty_message_snapshot(self):
         """更新的 bulk_update 成功快照应覆盖更早的存量 message="" 记录。"""
@@ -211,7 +216,46 @@ class TestCollectKeepHistoryIds:
             status=True,
         )
 
-        assert _collect_keep_history_ids([strategy.id]) == {latest_bulk.id}
+        assert _keep_ids([strategy.id]) == {latest_bulk.id}
+
+    def test_newer_legacy_empty_message_overrides_older_successful_snapshot(self):
+        """窗口内更新的存量 message="" 批量成功，应覆盖更早的 status=True 快照。"""
+        strategy = _create_strategy("legacy-overrides-success")
+        base_time = timezone.now() - timedelta(days=10)
+        _create_history(strategy.id, base_time, operate="update", status=True)
+        latest_legacy = _create_history(
+            strategy.id,
+            base_time + timedelta(hours=1),
+            operate="update",
+            status=False,
+            message="",
+        )
+
+        assert _keep_ids([strategy.id]) == {latest_legacy.id}
+
+    def test_in_flight_empty_message_does_not_override_successful_snapshot(self):
+        """
+        save 进行中会先写入 status=False/message=""；该记录尚未进入清理窗口时，
+        不得作为全局最新可恢复快照，否则会误删窗口内旧的 status=True。
+        """
+        now = timezone.now()
+        before = now - timedelta(days=30)
+        strategy = _create_strategy("in-flight-empty-message")
+        older_success = _create_history(
+            strategy.id,
+            before - timedelta(days=1),
+            operate="update",
+            status=True,
+        )
+        _create_history(
+            strategy.id,
+            now - timedelta(hours=1),
+            operate="update",
+            status=False,
+            message="",
+        )
+
+        assert _keep_ids([strategy.id], before) == {older_success.id}
 
     def test_failed_update_with_message_is_not_kept(self):
         strategy = _create_strategy("failed-update")
@@ -223,7 +267,7 @@ class TestCollectKeepHistoryIds:
             message="update failed",
         )
 
-        assert _collect_keep_history_ids([strategy.id]) == set()
+        assert _keep_ids([strategy.id]) == set()
 
     def test_failed_update_does_not_override_older_recoverable_snapshot(self):
         strategy = _create_strategy("failed-after-success")
@@ -237,7 +281,7 @@ class TestCollectKeepHistoryIds:
             message="update failed",
         )
 
-        assert _collect_keep_history_ids([strategy.id]) == {older_success.id}
+        assert _keep_ids([strategy.id]) == {older_success.id}
 
     def test_same_create_time_uses_greater_id_as_latest(self):
         strategy = _create_strategy("same-time")
@@ -246,7 +290,7 @@ class TestCollectKeepHistoryIds:
         second = _create_history(strategy.id, create_time)
 
         assert second.id > first.id
-        assert _collect_keep_history_ids([strategy.id]) == {second.id}
+        assert _keep_ids([strategy.id]) == {second.id}
 
     def test_mixed_strategy_batch_uses_three_queries(self, django_assert_num_queries):
         existing = _create_strategy("query-count")
@@ -257,7 +301,7 @@ class TestCollectKeepHistoryIds:
         deleted_delete = _create_history(deleted_id, create_time, operate="delete")
 
         with django_assert_num_queries(3, connection=connections["monitor_api"]):
-            keep_ids = _collect_keep_history_ids([existing.id, deleted_id])
+            keep_ids = _keep_ids([existing.id, deleted_id])
 
         assert keep_ids == {existing_update.id, deleted_update.id, deleted_delete.id}
 
@@ -267,7 +311,7 @@ class TestCollectKeepHistoryIds:
         latest_update = _create_history(strategy.id, create_time)
 
         with CaptureQueriesContext(connections["monitor_api"]) as queries:
-            keep_ids = _collect_keep_history_ids([strategy.id])
+            keep_ids = _keep_ids([strategy.id])
 
         sql = " ".join(query["sql"] for query in queries.captured_queries).upper()
         assert keep_ids == {latest_update.id}
@@ -335,12 +379,12 @@ class TestDeleteQuerysetInBatches:
 class TestCleanStrategyHistory:
     def test_uses_fixed_cutoff_during_entire_cleanup(self, monkeypatch):
         start_time = timezone.make_aware(datetime(2026, 7, 19, 12, 0, 0))
-        now_values = iter((start_time, start_time + timedelta(days=2)))
-        now_calls = []
+        current = {"value": start_time, "calls": 0}
 
         def moving_now():
-            now_calls.append(1)
-            return next(now_values)
+            # history.timezone 即 django.utils.timezone，建数据时 auto_now_add 也会走到这里
+            current["calls"] += 1
+            return current["value"]
 
         monkeypatch.setattr("bkmonitor.strategy.history.timezone.now", moving_now)
         strategy = _create_strategy("fixed-cutoff")
@@ -352,11 +396,16 @@ class TestCleanStrategyHistory:
             message="update failed",
         )
 
-        deleted = clean_strategy_history(CleanStrategyHistoryParams(days=30))
+        params = CleanStrategyHistoryParams(days=30)
+        calls_after_params = current["calls"]
+        current["value"] = start_time + timedelta(days=2)
+
+        deleted = clean_strategy_history(params)
 
         assert deleted == 0
         assert StrategyHistoryModel.objects.filter(id=not_expired_at_start.id).exists()
-        assert len(now_calls) == 1
+        # before 已在 params 创建时冻结，清理过程不应再读取 now
+        assert current["calls"] == calls_after_params
 
     def test_cleans_old_histories_and_preserves_records_required_by_each_strategy_state(self, monkeypatch):
         now = timezone.make_aware(datetime(2026, 7, 19, 12, 0, 0))
@@ -445,6 +494,40 @@ class TestCleanStrategyHistory:
 
         assert would_delete == 2
         assert set(StrategyHistoryModel.objects.filter(id__in=old_ids).values_list("id", flat=True)) == set(old_ids)
+
+    def test_cleanup_keeps_old_success_when_newer_in_flight_empty_message_exists(self, monkeypatch):
+        """清理时窗口外的进行中 message="" 不得导致窗口内 status=True 快照被删。"""
+        now = timezone.make_aware(datetime(2026, 7, 19, 12, 0, 0))
+        monkeypatch.setattr("bkmonitor.strategy.history.timezone.now", lambda: now)
+        strategy = _create_strategy("cleanup-in-flight")
+        kept_success = _create_history(
+            strategy.id,
+            now - timedelta(days=31),
+            operate="update",
+            status=True,
+        )
+        older_success = _create_history(
+            strategy.id,
+            now - timedelta(days=32),
+            operate="update",
+            status=True,
+        )
+        in_flight = _create_history(
+            strategy.id,
+            now - timedelta(hours=1),
+            operate="update",
+            status=False,
+            message="",
+        )
+
+        deleted = clean_strategy_history(CleanStrategyHistoryParams(days=30))
+
+        assert deleted == 1
+        assert set(StrategyHistoryModel.objects.values_list("id", flat=True)) == {
+            kept_success.id,
+            in_flight.id,
+        }
+        assert not StrategyHistoryModel.objects.filter(id=older_success.id).exists()
 
     def test_strategy_ids_limit_cleanup_scope(self, monkeypatch):
         now = timezone.make_aware(datetime(2026, 7, 19, 12, 0, 0))

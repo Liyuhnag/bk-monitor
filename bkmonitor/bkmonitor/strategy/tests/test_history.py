@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tencent is pleased to support the open source community by making 蓝鲸智云 - 监控平台 (BlueKing - Monitor) available.
 Copyright (C) 2017-2025 Tencent. All rights reserved.
@@ -149,9 +148,7 @@ class TestCollectKeepHistoryIds:
         )
         # 线上 delete_by_strategy_ids：status 默认 False
         _create_history(strategy_id, base_time, operate="delete", status=False)
-        latest_delete = _create_history(
-            strategy_id, base_time + timedelta(hours=2), operate="delete", status=False
-        )
+        latest_delete = _create_history(strategy_id, base_time + timedelta(hours=2), operate="delete", status=False)
 
         assert _collect_keep_history_ids([strategy_id]) == {latest_success.id, latest_delete.id}
 
@@ -181,6 +178,40 @@ class TestCollectKeepHistoryIds:
         )
 
         assert _collect_keep_history_ids([strategy.id]) == {bulk_success.id}
+
+    def test_latest_bulk_update_snapshot_is_kept(self):
+        """新写入的 bulk_update(status=True) 应作为可恢复快照保留。"""
+        strategy = _create_strategy("bulk-update-keep")
+        base_time = timezone.now() - timedelta(days=10)
+        _create_history(strategy.id, base_time, operate="update", status=True)
+        latest_bulk = _create_history(
+            strategy.id,
+            base_time + timedelta(hours=1),
+            operate="bulk_update",
+            status=True,
+        )
+
+        assert _collect_keep_history_ids([strategy.id]) == {latest_bulk.id}
+
+    def test_newer_bulk_update_overrides_legacy_empty_message_snapshot(self):
+        """更新的 bulk_update 成功快照应覆盖更早的存量 message="" 记录。"""
+        strategy = _create_strategy("bulk-overrides-legacy")
+        base_time = timezone.now() - timedelta(days=10)
+        _create_history(
+            strategy.id,
+            base_time,
+            operate="update",
+            status=False,
+            message="",
+        )
+        latest_bulk = _create_history(
+            strategy.id,
+            base_time + timedelta(hours=1),
+            operate="bulk_update",
+            status=True,
+        )
+
+        assert _collect_keep_history_ids([strategy.id]) == {latest_bulk.id}
 
     def test_failed_update_with_message_is_not_kept(self):
         strategy = _create_strategy("failed-update")
@@ -353,9 +384,7 @@ class TestCleanStrategyHistory:
         )
 
         deleted_id = 900003
-        kept_deleted_update = _create_history(
-            deleted_id, old_time - timedelta(hours=4), operate="update", status=True
-        )
+        kept_deleted_update = _create_history(deleted_id, old_time - timedelta(hours=4), operate="update", status=True)
         _create_history(
             deleted_id,
             old_time - timedelta(hours=3),
@@ -409,8 +438,7 @@ class TestCleanStrategyHistory:
         monkeypatch.setattr("bkmonitor.strategy.history.timezone.now", lambda: now)
         strategy = _create_strategy("dry-run")
         old_ids = [
-            _create_history(strategy.id, now - timedelta(days=31, hours=hour), status=True).id
-            for hour in (3, 2, 1)
+            _create_history(strategy.id, now - timedelta(days=31, hours=hour), status=True).id for hour in (3, 2, 1)
         ]
 
         would_delete = clean_strategy_history(CleanStrategyHistoryParams(days=30, dry_run=True))
@@ -429,9 +457,7 @@ class TestCleanStrategyHistory:
         unselected_old = _create_history(unselected.id, old_time - timedelta(hours=1))
         unselected_latest = _create_history(unselected.id, old_time)
 
-        deleted = clean_strategy_history(
-            CleanStrategyHistoryParams(days=30, strategy_ids=[selected.id], batch_size=1)
-        )
+        deleted = clean_strategy_history(CleanStrategyHistoryParams(days=30, strategy_ids=[selected.id], batch_size=1))
 
         assert deleted == 1
         assert not StrategyHistoryModel.objects.filter(id=selected_old.id).exists()
@@ -444,3 +470,111 @@ class TestCleanStrategyHistory:
         _create_history(900004, now - timedelta(days=1))
 
         assert clean_strategy_history(CleanStrategyHistoryParams(days=30)) == 0
+
+    def test_full_cleanup_covers_bulk_update_legacy_and_deleted_strategies(self, monkeypatch):
+        """
+        综合场景：同时覆盖
+        - bulk_update(status=True) 作为可恢复快照
+        - 存量 message="" 批量成功兼容
+        - 已删除策略保留最新快照 + 最新 delete
+        - 窗口外最新可恢复快照决定窗口内旧记录是否可删
+        - strategy_ids 未限定时多策略一并清理
+        """
+        now = timezone.make_aware(datetime(2026, 7, 19, 12, 0, 0))
+        monkeypatch.setattr("bkmonitor.strategy.history.timezone.now", lambda: now)
+        old_time = now - timedelta(days=31)
+        recent_time = now - timedelta(days=1)
+
+        # 已存在策略：全局最新可恢复在窗口内(recent bulk_update)，窗口内旧快照全部可删
+        existing = _create_strategy("full-existing")
+        old_existing_update = _create_history(existing.id, old_time - timedelta(hours=3), operate="update", status=True)
+        old_existing_bulk = _create_history(
+            existing.id,
+            old_time - timedelta(hours=2),
+            operate="bulk_update",
+            status=True,
+        )
+        old_existing_fail = _create_history(
+            existing.id,
+            old_time - timedelta(hours=1),
+            operate="update",
+            status=False,
+            message="update failed",
+        )
+        recent_existing = _create_history(
+            existing.id,
+            recent_time,
+            operate="bulk_update",
+            status=True,
+        )
+
+        # 仅有存量批量缺陷记录的策略：message="" 应保留，失败记录可删
+        legacy_only = _create_strategy("full-legacy")
+        kept_legacy = _create_history(
+            legacy_only.id,
+            old_time - timedelta(hours=1),
+            operate="update",
+            status=False,
+            message="",
+        )
+        old_legacy_fail = _create_history(
+            legacy_only.id,
+            old_time,
+            operate="update",
+            status=False,
+            message="update failed",
+        )
+
+        # 已删除策略：保留最新 bulk_update 快照 + 最新 delete
+        deleted_id = 900005
+        old_deleted_update = _create_history(deleted_id, old_time - timedelta(hours=4), operate="update", status=True)
+        old_deleted_legacy = _create_history(
+            deleted_id,
+            old_time - timedelta(hours=3),
+            operate="update",
+            status=False,
+            message="",
+        )
+        kept_deleted_snapshot = _create_history(
+            deleted_id,
+            old_time - timedelta(hours=2),
+            operate="bulk_update",
+            status=True,
+        )
+        old_deleted_delete = _create_history(deleted_id, old_time - timedelta(hours=1), operate="delete", status=False)
+        kept_deleted_delete = _create_history(
+            deleted_id,
+            old_time,
+            operate="delete",
+            status=False,
+        )
+        recent_deleted_fail = _create_history(
+            deleted_id,
+            recent_time,
+            operate="update",
+            status=False,
+            message="update failed",
+        )
+
+        deleted = clean_strategy_history(CleanStrategyHistoryParams(days=30, batch_size=2))
+
+        # existing 删 3 + legacy 删 1 + deleted 删 3
+        assert deleted == 7
+        assert set(StrategyHistoryModel.objects.values_list("id", flat=True)) == {
+            recent_existing.id,
+            kept_legacy.id,
+            kept_deleted_snapshot.id,
+            kept_deleted_delete.id,
+            recent_deleted_fail.id,
+        }
+        assert not StrategyHistoryModel.objects.filter(
+            id__in=[
+                old_existing_update.id,
+                old_existing_bulk.id,
+                old_existing_fail.id,
+                old_legacy_fail.id,
+                old_deleted_update.id,
+                old_deleted_legacy.id,
+                old_deleted_delete.id,
+            ]
+        ).exists()

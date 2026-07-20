@@ -113,7 +113,12 @@ class TestCollectKeepHistoryIds:
         base_time = timezone.now() - timedelta(days=10)
         old_success = _create_history(strategy.id, base_time, operate="create", status=True)
         latest_success = _create_history(strategy.id, base_time + timedelta(hours=1), status=True)
-        _create_history(strategy.id, base_time + timedelta(hours=2), status=False)
+        _create_history(
+            strategy.id,
+            base_time + timedelta(hours=2),
+            status=False,
+            message="update failed",
+        )
         # 线上 delete 默认 status=False；已存在策略不保留 delete
         _create_history(strategy.id, base_time + timedelta(hours=3), operate="delete", status=False)
 
@@ -164,16 +169,44 @@ class TestCollectKeepHistoryIds:
 
         assert _collect_keep_history_ids([strategy.id]) == {valid_snapshot.id}
 
-    def test_status_false_snapshot_is_not_kept_even_when_message_is_empty(self):
+    def test_legacy_bulk_update_success_with_empty_message_is_kept(self):
+        """存量批量更新成功：status=False 但 message="" 且 content 非空，应作为可恢复快照保留。"""
         strategy = _create_strategy("legacy-bulk-update")
+        bulk_success = _create_history(
+            strategy.id,
+            timezone.now() - timedelta(days=10),
+            operate="update",
+            status=False,
+            message="",
+        )
+
+        assert _collect_keep_history_ids([strategy.id]) == {bulk_success.id}
+
+    def test_failed_update_with_message_is_not_kept(self):
+        strategy = _create_strategy("failed-update")
         _create_history(
             strategy.id,
             timezone.now() - timedelta(days=10),
             operate="update",
             status=False,
+            message="update failed",
         )
 
         assert _collect_keep_history_ids([strategy.id]) == set()
+
+    def test_failed_update_does_not_override_older_recoverable_snapshot(self):
+        strategy = _create_strategy("failed-after-success")
+        base_time = timezone.now() - timedelta(days=10)
+        older_success = _create_history(strategy.id, base_time, operate="update", status=True)
+        _create_history(
+            strategy.id,
+            base_time + timedelta(hours=1),
+            operate="update",
+            status=False,
+            message="update failed",
+        )
+
+        assert _collect_keep_history_ids([strategy.id]) == {older_success.id}
 
     def test_same_create_time_uses_greater_id_as_latest(self):
         strategy = _create_strategy("same-time")
@@ -281,7 +314,12 @@ class TestCleanStrategyHistory:
         monkeypatch.setattr("bkmonitor.strategy.history.timezone.now", moving_now)
         strategy = _create_strategy("fixed-cutoff")
         _create_history(strategy.id, start_time - timedelta(days=31), status=True)
-        not_expired_at_start = _create_history(strategy.id, start_time - timedelta(days=29), status=False)
+        not_expired_at_start = _create_history(
+            strategy.id,
+            start_time - timedelta(days=29),
+            status=False,
+            message="update failed",
+        )
 
         deleted = clean_strategy_history(CleanStrategyHistoryParams(days=30))
 
@@ -298,7 +336,13 @@ class TestCleanStrategyHistory:
         existing = _create_strategy("integration-existing")
         _create_history(existing.id, old_time - timedelta(hours=3), operate="update", status=True)
         kept_existing = _create_history(existing.id, old_time - timedelta(hours=2), operate="update", status=True)
-        _create_history(existing.id, old_time - timedelta(hours=1), operate="update", status=False)
+        _create_history(
+            existing.id,
+            old_time - timedelta(hours=1),
+            operate="update",
+            status=False,
+            message="update failed",
+        )
         _create_history(existing.id, old_time, operate="delete", status=False)
         recent_existing = _create_history(
             existing.id,

@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from django.db.models import OuterRef, QuerySet, Subquery
+from django.db.models import OuterRef, Q, QuerySet, Subquery
 from django.utils import timezone
 
 from bkmonitor.models import StrategyHistoryModel, StrategyModel
@@ -68,10 +68,10 @@ def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
     """
     计算需要保留的历史记录 ID。
 
-    - 所有策略：保留最新一条成功的 create/update 快照（status=True 且 content 非空）
+    - 所有策略：保留最新一条可恢复的 create/update 快照（content 非空，且 status=True 或 message=""）
+      message="" 用于兼容存量批量更新成功记录（历史上未写 status=True）
     - 策略不存在：额外保留最新一条 delete（线上 delete 默认 status=False，故不按 status 过滤）
     """
-    # TODO:待确认批量写入时，成功后仍为 status=False（有 content）的历史该如何解决
     if not strategy_ids:
         return set()
     # 用来区分策略是否存在
@@ -82,8 +82,8 @@ def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
         StrategyHistoryModel.objects.filter(
             strategy_id__in=strategy_ids,
             operate__in=("create", "update"),
-            status=True,
         )
+        .filter(Q(status=True) | Q(message=""))
         .exclude(content={})
         .exclude(content__isnull=True)
     )
@@ -138,7 +138,7 @@ def clean_strategy_history(params: CleanStrategyHistoryParams) -> int:
     清理指定天数之前的策略变更历史。
 
     先按截止时间圈定可清理范围，再保留可恢复快照：
-    - 所有策略：保留最新一条有效的 create/update 快照
+    - 所有策略：保留最新一条可恢复的 create/update 快照（status=True 或 message=""）
     - 策略不存在：额外保留最新一条 delete
     其余可清理范围内的记录删除。
 

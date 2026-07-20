@@ -17,7 +17,7 @@ from bkmonitor.strategy.history import CleanStrategyHistoryParams, clean_strateg
 class Command(BaseCommand):
     help = (
         "清理指定天数之前的策略变更历史。"
-        "保留最新一条可恢复的 create/update 快照；策略不存在时额外保留最新一条 delete。"
+        "保留最新一条可恢复的 create/update/bulk_update 快照；策略不存在时额外保留最新一条 delete。"
     )
 
     def add_arguments(self, parser):

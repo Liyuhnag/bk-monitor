@@ -170,7 +170,7 @@ class TestCollectKeepHistoryIds:
         assert _collect_keep_history_ids([strategy.id]) == {valid_snapshot.id}
 
     def test_legacy_bulk_update_success_with_empty_message_is_kept(self):
-        """存量批量更新成功：status=False 但 message="" 且 content 非空，应作为可恢复快照保留。"""
+        """存量批量更新写入缺陷兼容：成功但未写 status=True（message=""），应作为可恢复快照保留。"""
         strategy = _create_strategy("legacy-bulk-update")
         bulk_success = _create_history(
             strategy.id,

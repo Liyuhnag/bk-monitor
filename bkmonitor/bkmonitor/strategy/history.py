@@ -68,8 +68,8 @@ def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
     """
     计算需要保留的历史记录 ID。
 
-    - 所有策略：保留最新一条可恢复的 create/update 快照（content 非空，且 status=True 或 message=""）
-      message="" 用于兼容存量批量更新成功记录（历史上未写 status=True）
+    - 所有策略：保留最新一条可恢复的 create/update/bulk_update 快照（content 非空，且 status=True；
+      另见下方 message="" 的存量兼容，不是通用成功判定）
     - 策略不存在：额外保留最新一条 delete（线上 delete 默认 status=False，故不按 status 过滤）
     """
     if not strategy_ids:
@@ -83,6 +83,8 @@ def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
             strategy_id__in=strategy_ids,
             operate__in=("create", "update", "bulk_update"),
         )
+        # message="" 仅兼容历史批量更新写入缺陷（成功但未写 status=True），不是通用成功判定；
+        # 新写入应以 status=True 为准，勿扩大该条件的语义。
         .filter(Q(status=True) | Q(message=""))
         .exclude(content={})
         .exclude(content__isnull=True)
@@ -138,7 +140,8 @@ def clean_strategy_history(params: CleanStrategyHistoryParams) -> int:
     清理指定天数之前的策略变更历史。
 
     先按截止时间圈定可清理范围，再保留可恢复快照：
-    - 所有策略：保留最新一条可恢复的 create/update 快照（status=True 或 message=""）
+    - 所有策略：保留最新一条可恢复的 create/update/bulk_update 快照（以 status=True 为准；
+      message="" 仅兼容历史批量更新写入缺陷，不是通用成功判定）
     - 策略不存在：额外保留最新一条 delete
     其余可清理范围内的记录删除。
 

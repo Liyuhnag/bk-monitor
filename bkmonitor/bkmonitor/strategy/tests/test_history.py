@@ -84,11 +84,22 @@ class TestCleanStrategyHistoryParams:
         assert params.batch_size == 1000
         assert params.dry_run is False
 
-    def test_before_uses_current_time(self, monkeypatch):
+    def test_before_is_frozen_at_init(self, monkeypatch):
         now = timezone.make_aware(datetime(2026, 7, 19, 12, 0, 0))
-        monkeypatch.setattr("bkmonitor.strategy.history.timezone.now", lambda: now)
+        later = now + timedelta(seconds=30)
+        current = {"value": now}
 
-        assert CleanStrategyHistoryParams(days=7).before == now - timedelta(days=7)
+        monkeypatch.setattr(
+            "bkmonitor.strategy.history.timezone.now",
+            lambda: current["value"],
+        )
+
+        params = CleanStrategyHistoryParams(days=7)
+        expected = now - timedelta(days=7)
+        assert params.before == expected
+
+        current["value"] = later
+        assert params.before == expected
 
 
 @pytest.mark.django_db(databases=("default", "monitor_api"))
@@ -103,7 +114,8 @@ class TestCollectKeepHistoryIds:
         old_success = _create_history(strategy.id, base_time, operate="create", status=True)
         latest_success = _create_history(strategy.id, base_time + timedelta(hours=1), status=True)
         _create_history(strategy.id, base_time + timedelta(hours=2), status=False)
-        _create_history(strategy.id, base_time + timedelta(hours=3), operate="delete", status=True)
+        # 线上 delete 默认 status=False；已存在策略不保留 delete
+        _create_history(strategy.id, base_time + timedelta(hours=3), operate="delete", status=False)
 
         assert _collect_keep_history_ids([strategy.id]) == {latest_success.id}
         assert old_success.id != latest_success.id
@@ -130,9 +142,10 @@ class TestCollectKeepHistoryIds:
             status=False,
             message="update failed",
         )
+        # 线上 delete_by_strategy_ids：status 默认 False
         _create_history(strategy_id, base_time, operate="delete", status=False)
         latest_delete = _create_history(
-            strategy_id, base_time + timedelta(hours=2), operate="delete", status=True
+            strategy_id, base_time + timedelta(hours=2), operate="delete", status=False
         )
 
         assert _collect_keep_history_ids([strategy_id]) == {latest_success.id, latest_delete.id}
@@ -286,7 +299,7 @@ class TestCleanStrategyHistory:
         _create_history(existing.id, old_time - timedelta(hours=3), operate="update", status=True)
         kept_existing = _create_history(existing.id, old_time - timedelta(hours=2), operate="update", status=True)
         _create_history(existing.id, old_time - timedelta(hours=1), operate="update", status=False)
-        _create_history(existing.id, old_time, operate="delete", status=True)
+        _create_history(existing.id, old_time, operate="delete", status=False)
         recent_existing = _create_history(
             existing.id,
             recent_time,
@@ -307,7 +320,7 @@ class TestCleanStrategyHistory:
             message="update failed",
         )
         _create_history(deleted_id, old_time - timedelta(hours=2), operate="delete", status=False)
-        kept_deleted_delete = _create_history(deleted_id, old_time - timedelta(hours=1), operate="delete", status=True)
+        kept_deleted_delete = _create_history(deleted_id, old_time - timedelta(hours=1), operate="delete", status=False)
         _create_history(
             deleted_id,
             old_time,

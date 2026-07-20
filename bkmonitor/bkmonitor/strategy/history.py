@@ -10,7 +10,7 @@ specific language governing permissions and limitations under the License.
 """
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from django.db.models import OuterRef, QuerySet, Subquery
@@ -29,6 +29,8 @@ class CleanStrategyHistoryParams:
     strategy_ids: list[int] | None = None
     batch_size: int = 1000
     dry_run: bool = False
+    # 创建时冻结，保证日志打印的截止时间与实际删除过滤一致
+    before: datetime = field(init=False)
 
     def __post_init__(self):
         if not isinstance(self.days, int) or isinstance(self.days, bool) or self.days <= 0:
@@ -37,18 +39,13 @@ class CleanStrategyHistoryParams:
             raise ValueError("batch_size must be a positive integer")
         if not isinstance(self.dry_run, bool):
             raise ValueError("dry_run must be a bool")
-        if self.strategy_ids is None:
-            return
-        if not isinstance(self.strategy_ids, list) or not self.strategy_ids:
-            raise ValueError("strategy_ids must be a non-empty list of int")
-        for strategy_id in self.strategy_ids:
-            if not isinstance(strategy_id, int) or isinstance(strategy_id, bool):
+        if self.strategy_ids is not None:
+            if not isinstance(self.strategy_ids, list) or not self.strategy_ids:
                 raise ValueError("strategy_ids must be a non-empty list of int")
-
-    @property
-    def before(self) -> datetime:
-        """清理截止时间：仅处理 create_time 早于该时间的记录"""
-        return timezone.now() - timedelta(days=self.days)
+            for strategy_id in self.strategy_ids:
+                if not isinstance(strategy_id, int) or isinstance(strategy_id, bool):
+                    raise ValueError("strategy_ids must be a non-empty list of int")
+        self.before = timezone.now() - timedelta(days=self.days)
 
 
 def _collect_latest_history_ids(
@@ -71,15 +68,13 @@ def _collect_keep_history_ids(strategy_ids: list[int]) -> set[int]:
     """
     计算需要保留的历史记录 ID。
 
-    - 所有策略：保留最新一条成功的 create/update 快照
-    - 策略不存在：额外保留最新一条 delete
-
-    v2 批量修改产生的历史记录默认为 status=False。记得询问一下如何修改
-    仅保留明确成功的快照，避免将失败或状态不确定的记录当作恢复基线。
+    - 所有策略：保留最新一条成功的 create/update 快照（status=True 且 content 非空）
+    - 策略不存在：额外保留最新一条 delete（线上 delete 默认 status=False，故不按 status 过滤）
     """
+    # TODO:待确认批量写入时，成功后仍为 status=False（有 content）的历史该如何解决
     if not strategy_ids:
         return set()
-
+    # 用来区分策略是否存在
     existing_ids = set(StrategyModel.objects.filter(id__in=strategy_ids).values_list("id", flat=True))
     deleted_ids = set(strategy_ids) - existing_ids
 
